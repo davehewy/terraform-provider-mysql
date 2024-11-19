@@ -130,6 +130,14 @@ func Provider() *schema.Provider {
 				}, false),
 			},
 
+			"use_system_certs": {
+				Type:        schema.TypeBool,
+				Optional:    true,
+				Default:     false,
+				Description: "Use system certificate pool for TLS verification. See https://pkg.go.dev/crypto/x509#SystemCertPool for more info.",
+				DefaultFunc: schema.EnvDefaultFunc("MYSQL_USE_SYSTEM_CERTS", false),
+			},
+
 			"custom_tls": {
 				Type:     schema.TypeList,
 				Optional: true,
@@ -137,23 +145,39 @@ func Provider() *schema.Provider {
 				Elem: &schema.Resource{
 					Schema: map[string]*schema.Schema{
 						"config_key": {
-							Type:     schema.TypeString,
-							Default:  "custom",
-							Optional: true,
+							Type:        schema.TypeString,
+							Optional:    true,
+							DefaultFunc: schema.EnvDefaultFunc("MYSQL_TLS_CONFIG_KEY", "custom"),
 						},
 						"ca_cert": {
 							Type:     schema.TypeString,
 							Required: true,
+							DefaultFunc: schema.MultiEnvDefaultFunc(
+								[]string{
+									"MYSQL_TLS_CA_CERT",
+								},
+								nil,
+							),
 						},
 						"client_cert": {
 							Type:     schema.TypeString,
-							Default:  "",
 							Optional: true,
+							DefaultFunc: schema.MultiEnvDefaultFunc(
+								[]string{
+									"MYSQL_TLS_CLIENT_CERT",
+								},
+								"",
+							),
 						},
 						"client_key": {
 							Type:     schema.TypeString,
-							Default:  "",
 							Optional: true,
+							DefaultFunc: schema.MultiEnvDefaultFunc(
+								[]string{
+									"MYSQL_TLS_CLIENT_KEY",
+								},
+								"",
+							),
 						},
 					},
 				},
@@ -331,67 +355,84 @@ func providerConfigure(ctx context.Context, d *schema.ResourceData) (interface{}
 	var privateIp = d.Get("private_ip").(bool)
 	var tlsConfig = d.Get("tls").(string)
 	var tlsConfigStruct *tls.Config
+	var rootCertPool *x509.CertPool
+	configKey := "custom" // Default config key used for system certs
 
+	// Handle TLS configuration if it has been provided
 	customTLSMap := d.Get("custom_tls").([]interface{})
 	if len(customTLSMap) > 0 {
-		var customTLS CustomTLS
-		var rootCertPool *x509.CertPool
+		log.Printf("[DEBUG] Processing custom TLS configuration")
+
 		customMap := customTLSMap[0].(map[string]interface{})
 		customTLSJson, err := json.Marshal(customMap)
 		if err != nil {
 			return nil, diag.Errorf("failed to marshal tls config %v with error %v", customTLSMap, err)
 		}
 
-		err = json.Unmarshal(customTLSJson, &customTLS)
-		if err != nil {
+		var customTLS CustomTLS
+		if err := json.Unmarshal(customTLSJson, &customTLS); err != nil {
 			return nil, diag.Errorf("failed to unmarshal tls config %v with error %v", customTLSJson, err)
 		}
 
-		var pem []byte
+		if customTLS.ConfigKey != "" {
+			configKey = customTLS.ConfigKey
+		}
+
+		// Only override system certs if custom CA cert is provided.
 		if customTLS.CACert != "" {
-			rootCertPool := x509.NewCertPool()
+			rootCertPool = x509.NewCertPool()
+			var pem []byte
 			if strings.HasPrefix(customTLS.CACert, "-----BEGIN") {
+				log.Printf("[DEBUG] Using custom CA cert from string")
 				pem = []byte(customTLS.CACert)
 			} else {
+				log.Printf("[DEBUG] Reading CA cert from file %v", customTLS.CACert)
 				pem, err = os.ReadFile(customTLS.CACert)
 				if err != nil {
 					return nil, diag.Errorf("failed to read CA cert: %v", err)
 				}
 			}
+
 			if ok := rootCertPool.AppendCertsFromPEM(pem); !ok {
 				return nil, diag.Errorf("failed to append pem: %v", pem)
 			}
-		} else {
-			// Use system cert pool as fallback
-			rootCertPool, err = x509.SystemCertPool()
-			if err != nil {
-				return nil, diag.Errorf("failed to get system cert pool: %v", err)
+
+			tlsConfigStruct = &tls.Config{
+				RootCAs: rootCertPool,
+			}
+
+			// Process client cert/key if provided.
+			if customTLS.ClientCert != "" && customTLS.ClientKey == "" {
+				var cert tls.Certificate
+				if strings.HasPrefix(customTLS.ClientCert, "-----BEGIN") {
+					cert, err = tls.X509KeyPair([]byte(customTLS.ClientCert), []byte(customTLS.ClientCert))
+				} else {
+					cert, err = tls.LoadX509KeyPair(customTLS.ClientCert, customTLS.ClientCert)
+				}
+				if err != nil {
+					return nil, diag.Errorf("error loading keypair: %v", err)
+				}
+				tlsConfigStruct.Certificates = []tls.Certificate{cert}
 			}
 		}
-
+	} else if d.Get("use_system_certs").(bool) {
+		// Only initialize system certs if no custom_tls is provided and use_system_certs is set to true
+		var err error
+		rootCertPool, err = x509.SystemCertPool()
+		if err != nil {
+			return nil, diag.Errorf("failed to get system cert pool: %v", err)
+		}
+		configKey = "system_certs"
 		tlsConfigStruct = &tls.Config{
 			RootCAs: rootCertPool,
 		}
+	}
 
-		var cert tls.Certificate
-
-		if customTLS.ClientCert != "" && customTLS.ClientKey != "" {
-			if strings.HasPrefix(customTLS.ClientCert, "-----BEGIN") {
-				cert, err = tls.X509KeyPair([]byte(customTLS.ClientCert), []byte(customTLS.ClientKey))
-			} else {
-				cert, err = tls.LoadX509KeyPair(customTLS.ClientCert, customTLS.ClientKey)
-			}
-			if err != nil {
-				return nil, diag.Errorf("error loading keypair: %v", err)
-			}
-			tlsConfigStruct.Certificates = []tls.Certificate{cert}
+	if tlsConfigStruct != nil {
+		if err := mysql.RegisterTLSConfig(configKey, tlsConfigStruct); err != nil {
+			return nil, diag.Errorf("failed to register TLS config: %v", err)
 		}
-
-		err = mysql.RegisterTLSConfig(customTLS.ConfigKey, tlsConfigStruct)
-		if err != nil {
-			return nil, diag.Errorf("failed registering TLS config: %v", err)
-		}
-		tlsConfig = customTLS.ConfigKey
+		tlsConfig = configKey
 	}
 
 	proto := "tcp"
@@ -521,6 +562,8 @@ func providerConfigure(ctx context.Context, d *schema.ResourceData) (interface{}
 		connParams[k] = v
 	}
 
+	log.Printf("[DEBUG] Using tlsconfig: %v", tlsConfig)
+
 	conf := mysql.Config{
 		User:                    username,
 		Passwd:                  password,
@@ -534,6 +577,7 @@ func providerConfigure(ctx context.Context, d *schema.ResourceData) (interface{}
 	}
 
 	if tlsConfigStruct != nil {
+		log.Printf("[DEBUG] Using custom TLS config %v", tlsConfigStruct)
 		conf.TLS = tlsConfigStruct
 	}
 
